@@ -1,0 +1,26 @@
+{
+  "models": [
+    {
+      "alias": "bge-m3",
+      "model_id": "BAAI/bge-m3",
+      "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+      "languages": ["mul"],
+      "load_strategy": "eager",
+      "batch_size": 8,
+      "max_sequence_length": 8192,
+      "normalize_embeddings": true,
+      "max_concurrency": 1
+    },
+    {
+      "alias": "all-minilm-l6-v2",
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "b8903db39f65d93ae28d49a37c4f3fa90c5f94e0",
+      "languages": ["en"],
+      "load_strategy": "lazy",
+      "batch_size": 32,
+      "max_sequence_length": 256,
+      "normalize_embeddings": true,
+      "max_concurrency": 2
+    }
+  ]
+}
