@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -25,6 +26,9 @@ from .schemas import (
 )
 
 logger = logging.getLogger("autoexam_embeddings")
+_correlation: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "embedding_correlation", default=None
+)
 
 
 class EmbeddingModel(Protocol):
@@ -50,8 +54,25 @@ class RequestLimitError(ValueError):
     """Raised when a request exceeds its configured model batch limit."""
 
 
-def _log_event(event: str, **fields: object) -> None:
-    logger.info(json.dumps({"event": event, **fields}, sort_keys=True, separators=(",", ":")))
+def set_log_correlation(
+    fields: dict[str, str],
+) -> contextvars.Token[dict[str, str] | None]:
+    return _correlation.set(fields)
+
+
+def reset_log_correlation(token: contextvars.Token[dict[str, str] | None]) -> None:
+    _correlation.reset(token)
+
+
+def log_event(event: str, *, level: int = logging.INFO, **fields: object) -> None:
+    logger.log(
+        level,
+        json.dumps(
+            {"event": event, **(_correlation.get() or {}), **fields},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def default_model_factory(config: ModelConfig) -> EmbeddingModel:
@@ -97,16 +118,18 @@ class ModelRegistry:
 
     async def start(self) -> None:
         """Load all eager models before declaring the registry ready."""
-
+        log_event("service_starting", models=len(self._runtimes))
         for runtime in self._runtimes.values():
             if runtime.config.load_strategy == "eager":
                 await self._get_or_load(runtime)
         self.ready = True
+        log_event("service_ready", models=len(self._runtimes))
 
     async def shutdown(self) -> None:
         """Stop accepting ready traffic and release model references."""
 
         self.ready = False
+        log_event("service_stopping", models=len(self._runtimes))
         for runtime in self._runtimes.values():
             runtime.model = None
             runtime.dimension = None
@@ -139,17 +162,27 @@ class ModelRegistry:
                 f"input batch contains {len(inputs)} items; limit is {runtime.config.batch_size}"
             )
 
+        log_event(
+            "embedding_started",
+            level=logging.DEBUG,
+            model_alias=alias,
+            batch_size=len(inputs),
+            input_type=input_type,
+            input_characters=sum(len(value) for value in inputs),
+        )
         model = await self._get_or_load(runtime)
         started_at = time.perf_counter()
+        wait_started_at = time.perf_counter()
         try:
             async with runtime.semaphore:
+                wait_ms = round((time.perf_counter() - wait_started_at) * 1000, 3)
                 vectors = await self._run_in_worker(
                     partial(self._encode, runtime.config, model, inputs, input_type)
                 )
         except (ModelUnavailableError, RequestLimitError):
             raise
         except Exception as error:
-            _log_event(
+            log_event(
                 "embedding_failed",
                 model_alias=alias,
                 batch_size=len(inputs),
@@ -161,13 +194,14 @@ class ModelRegistry:
         dimension = len(vectors[0])
         runtime.dimension = dimension
         elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
-        _log_event(
+        log_event(
             "embedding_completed",
             model_alias=alias,
             batch_size=len(inputs),
             input_type=input_type,
             dimension=dimension,
             duration_ms=elapsed_ms,
+            semaphore_wait_ms=wait_ms,
             load_state=runtime.status,
         )
         return EmbeddingsResponse(
@@ -183,16 +217,47 @@ class ModelRegistry:
     async def token_limits(self, alias: str) -> TokenLimits:
         runtime = self._runtimes[alias]
         model = await self._get_or_load(runtime)
+        started_at = time.perf_counter()
         async with runtime.semaphore:
-            return await self._run_in_worker(partial(chunking.limits, model, runtime.config))
+            result = await self._run_in_worker(partial(chunking.limits, model, runtime.config))
+        log_event(
+            "limits_resolved",
+            level=logging.DEBUG,
+            model_alias=alias,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            document_limit=result.document,
+            query_limit=result.query,
+            batch_size=result.batch_size,
+        )
+        return result
 
     async def chunk(self, alias: str, payload: ChunkRequest) -> ChunkResponse:
         runtime = self._runtimes[alias]
         model = await self._get_or_load(runtime)
-        async with runtime.semaphore:
-            return await self._run_in_worker(
-                partial(chunking.chunk, model, runtime.config, payload)
+        started_at = time.perf_counter()
+        try:
+            async with runtime.semaphore:
+                result = await self._run_in_worker(
+                    partial(chunking.chunk, model, runtime.config, payload)
+                )
+        except Exception as error:
+            log_event(
+                "chunking_failed",
+                model_alias=alias,
+                error_type=type(error).__name__,
+                input_characters=len(payload.text),
             )
+            raise
+        log_event(
+            "chunking_completed",
+            model_alias=alias,
+            input_characters=len(payload.text),
+            chunk_count=len(result.chunks),
+            chunk_size_tokens=payload.chunk_size_tokens,
+            chunk_overlap_tokens=payload.chunk_overlap_tokens,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+        )
+        return result
 
     async def _get_or_load(self, runtime: ModelRuntime) -> EmbeddingModel:
         if runtime.model is not None:
@@ -203,7 +268,7 @@ class ModelRegistry:
                 return runtime.model
             runtime.status = "loading"
             started_at = time.perf_counter()
-            _log_event("model_loading", model_alias=runtime.config.alias, load_state=runtime.status)
+            log_event("model_loading", model_alias=runtime.config.alias, load_state=runtime.status)
             try:
                 model = await self._run_in_worker(partial(self._model_factory, runtime.config))
                 dimension = model.get_sentence_embedding_dimension()
@@ -213,7 +278,7 @@ class ModelRegistry:
                 runtime.status = "failed"
                 runtime.model = None
                 runtime.dimension = None
-                _log_event(
+                log_event(
                     "model_load_failed",
                     model_alias=runtime.config.alias,
                     duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
@@ -227,7 +292,7 @@ class ModelRegistry:
             runtime.model = model
             runtime.dimension = dimension
             runtime.status = "ready"
-            _log_event(
+            log_event(
                 "model_loaded",
                 model_alias=runtime.config.alias,
                 dimension=dimension,

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,7 +15,15 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from .config import is_valid_locale, load_config
-from .registry import ModelFactory, ModelRegistry, ModelUnavailableError, RequestLimitError
+from .registry import (
+    ModelFactory,
+    ModelRegistry,
+    ModelUnavailableError,
+    RequestLimitError,
+    log_event,
+    reset_log_correlation,
+    set_log_correlation,
+)
 from .schemas import (
     ChunkRequest,
     ChunkResponse,
@@ -53,6 +64,48 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    @application.middleware("http")
+    async def correlation_logging(request: Request, call_next):  # type: ignore[no-untyped-def]
+        def bounded(name: str, generated: str = "") -> str:
+            value = request.headers.get(name, generated).strip()
+            return (
+                value
+                if len(value) <= 200 and re.fullmatch(r"[A-Za-z0-9._:-]+", value)
+                else generated
+            )
+
+        request_id = bounded("X-Request-ID", str(uuid.uuid4()))
+        fields = {"request_id": request_id}
+        for header, field in (
+            ("X-Workflow-ID", "workflow_id"),
+            ("X-RAG-Document-ID", "rag_document_id"),
+            ("X-RAG-Attempt", "rag_attempt"),
+        ):
+            if value := bounded(header):
+                fields[field] = value
+        token = set_log_correlation(fields)
+        started_at = time.perf_counter()
+        log_event(
+            "request_started",
+            level=logging.DEBUG,
+            method=request.method,
+            path=request.url.path,
+        )
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            log_event(
+                "request_completed",
+                level=logging.DEBUG,
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 3),
+            )
+            return response
+        finally:
+            reset_log_correlation(token)
 
     @application.get("/health/live")
     async def health_live() -> dict[str, str]:

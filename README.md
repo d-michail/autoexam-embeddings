@@ -24,6 +24,12 @@ discovery only; embedding routes neither accept nor enforce a locale.
 Configuration is read at process startup. In Kubernetes, ConfigMap reloader
 restarts the pod after the mounted configuration changes.
 
+`LOG_LEVEL` defaults to `INFO`; set it to `DEBUG` for request, semaphore,
+worker, tokenizer-limit and chunking diagnostics. Logs include bounded request
+and workflow correlation identifiers supplied by callers, aggregate sizes and
+durations, but never input text or embedding vectors. Responses echo
+`X-Request-ID` so a backend request can be followed across services.
+
 ## API
 
 ```bash
