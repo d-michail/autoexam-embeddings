@@ -22,6 +22,7 @@ class EmbeddingItem(BaseModel):
 
 
 class EmbeddingsResponse(BaseModel):
+    fingerprint: str
     model: str
     input_type: Literal["query", "document"]
     dimension: int
@@ -41,3 +42,29 @@ class ModelDescription(BaseModel):
 
 class ModelsResponse(BaseModel):
     data: list[ModelDescription]
+
+
+class TokenLimits(BaseModel):
+    document: int
+    query: int
+    fingerprint: str
+    batch_size: int
+
+
+class ChunkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, max_length=65536)
+    chunk_size_tokens: int | None = Field(default=None, gt=0)
+    chunk_overlap_tokens: int | None = Field(default=None, ge=0)
+
+
+class ChunkItem(BaseModel):
+    text: str
+    start: int
+    end: int
+    token_count: int
+
+
+class ChunkResponse(BaseModel):
+    fingerprint: str
+    chunks: list[ChunkItem]

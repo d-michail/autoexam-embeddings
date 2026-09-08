@@ -13,7 +13,14 @@ from fastapi.responses import JSONResponse
 
 from .config import is_valid_locale, load_config
 from .registry import ModelFactory, ModelRegistry, ModelUnavailableError, RequestLimitError
-from .schemas import EmbeddingsRequest, EmbeddingsResponse, ModelsResponse
+from .schemas import (
+    ChunkRequest,
+    ChunkResponse,
+    EmbeddingsRequest,
+    EmbeddingsResponse,
+    ModelsResponse,
+    TokenLimits,
+)
 
 DEFAULT_CONFIG_PATH = "/etc/autoexam-embeddings/config.json"
 
@@ -83,6 +90,28 @@ def create_app(
             return await registry.embed(alias, payload.input, payload.input_type)
         except RequestLimitError as error:
             raise HTTPException(status_code=413, detail=str(error)) from error
+        except ModelUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @application.get("/v1/models/{alias}/limits", response_model=TokenLimits)
+    async def model_limits(alias: str, request: Request) -> TokenLimits:
+        registry = _registry(request)
+        if registry.get(alias) is None:
+            raise HTTPException(status_code=404, detail="unknown model alias")
+        try:
+            return await registry.token_limits(alias)
+        except ModelUnavailableError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @application.post("/v1/models/{alias}/chunks", response_model=ChunkResponse)
+    async def chunks(alias: str, payload: ChunkRequest, request: Request) -> ChunkResponse:
+        registry = _registry(request)
+        if registry.get(alias) is None:
+            raise HTTPException(status_code=404, detail="unknown model alias")
+        try:
+            return await registry.chunk(alias, payload)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         except ModelUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 

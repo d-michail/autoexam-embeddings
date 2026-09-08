@@ -13,8 +13,16 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal, Protocol, TypeVar, cast
 
+from . import chunking
 from .config import ModelConfig, ServiceConfig
-from .schemas import EmbeddingItem, EmbeddingsResponse, ModelDescription
+from .schemas import (
+    ChunkRequest,
+    ChunkResponse,
+    EmbeddingItem,
+    EmbeddingsResponse,
+    ModelDescription,
+    TokenLimits,
+)
 
 logger = logging.getLogger("autoexam_embeddings")
 
@@ -138,7 +146,7 @@ class ModelRegistry:
                 vectors = await self._run_in_worker(
                     partial(self._encode, runtime.config, model, inputs, input_type)
                 )
-        except ModelUnavailableError:
+        except (ModelUnavailableError, RequestLimitError):
             raise
         except Exception as error:
             _log_event(
@@ -163,6 +171,7 @@ class ModelRegistry:
             load_state=runtime.status,
         )
         return EmbeddingsResponse(
+            fingerprint=chunking.fingerprint(runtime.config),
             model=alias,
             input_type=input_type,
             dimension=dimension,
@@ -170,6 +179,20 @@ class ModelRegistry:
                 EmbeddingItem(index=index, embedding=vector) for index, vector in enumerate(vectors)
             ],
         )
+
+    async def token_limits(self, alias: str) -> TokenLimits:
+        runtime = self._runtimes[alias]
+        model = await self._get_or_load(runtime)
+        async with runtime.semaphore:
+            return await self._run_in_worker(partial(chunking.limits, model, runtime.config))
+
+    async def chunk(self, alias: str, payload: ChunkRequest) -> ChunkResponse:
+        runtime = self._runtimes[alias]
+        model = await self._get_or_load(runtime)
+        async with runtime.semaphore:
+            return await self._run_in_worker(
+                partial(chunking.chunk, model, runtime.config, payload)
+            )
 
     async def _get_or_load(self, runtime: ModelRuntime) -> EmbeddingModel:
         if runtime.model is not None:
@@ -220,6 +243,12 @@ class ModelRegistry:
         inputs: list[str],
         input_type: Literal["query", "document"],
     ) -> list[list[float]]:
+        if hasattr(model, "tokenizer"):
+            if any(
+                chunking.token_count(model, text, input_type) > config.max_sequence_length
+                for text in inputs
+            ):
+                raise RequestLimitError("input exceeds model token limit")
         encode = model.encode_query if input_type == "query" else model.encode_document
         raw_vectors = encode(
             inputs,

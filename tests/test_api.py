@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 
 from autoexam_embeddings.app import create_app
+from autoexam_embeddings.chunking import fingerprint
 from autoexam_embeddings.config import ModelConfig, ServiceConfig
 from autoexam_embeddings.registry import ModelRegistry
 
@@ -125,6 +126,9 @@ async def test_health_discovery_dispatch_ordering_and_limits(tmp_path: Path) -> 
         )
         assert response.status_code == 200
         assert response.json() == {
+            "fingerprint": fingerprint(
+                ModelConfig.model_validate(configured_model("english", ["en"]))
+            ),
             "model": "english",
             "input_type": "query",
             "dimension": 3,

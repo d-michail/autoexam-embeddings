@@ -72,3 +72,24 @@ download time, memory, and cache space.
 The container runs as UID/GID 10001, uses one Uvicorn worker, stores Hugging Face
 artifacts under `/var/cache/huggingface`, and handles `SIGTERM` through Uvicorn's
 normal graceful shutdown.
+
+## RAG tokenizer API
+
+`GET /v1/models/{alias}/limits` lazily loads the selected model and returns
+`document`/`query` content token budgets (after prompts and special tokens),
+`batch_size`, and an immutable-configuration `fingerprint`.
+
+`POST /v1/models/{alias}/chunks` accepts `text` (1–65,536 Unicode code points),
+optional `chunk_size_tokens`, and optional `chunk_overlap_tokens`. Defaults are
+`min(512, document_budget)` and `min(64, size // 8)`. The response contains
+`fingerprint` and `chunks`, each with `text`, `start`, `end`, and `token_count`.
+Offsets reference the original input's Unicode code points; token counts include
+prompts and special tokens. Text slices preserve the source rather than decoding
+token IDs. These endpoints use the model's existing worker pool, lazy-load lock
+and concurrency semaphore. A fast tokenizer with offset mappings is required.
+
+Embedding responses also include `fingerprint`. It covers the pinned model ID,
+revision and vector-affecting configuration, excluding deployment batching,
+concurrency and discovery metadata. Embedding inputs exceeding the configured
+context are rejected with HTTP 413, avoiding silent truncation. Applications
+should compare fingerprints across chunking, embedding and stored collections.
