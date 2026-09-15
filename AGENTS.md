@@ -6,8 +6,12 @@ Python/FastAPI service for internal dense Sentence Transformers inference.
 
 - Keep the service independent from the AutoExam backend and database.
 - Expose dense float embeddings only. Sparse vectors, ColBERT, reranking, Ray,
-  GPUs, quantization, and private or gated Hugging Face repositories are out of
+  quantization, and private or gated Hugging Face repositories are out of
   scope.
+- The compute device (`cpu` or `cuda`) is a single service-wide config field
+  (`device`), not per-model. It selects the container image and Kubernetes
+  scheduling as well as the in-process `SentenceTransformer` device, so it is
+  a deploy-time choice like `cpu_limit`, not something to expose per request.
 - Do not add application authentication or public routing. Kubernetes namespace
   isolation and the ClusterIP service are the trust boundary.
 - Never log input text or embedding vectors.

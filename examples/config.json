@@ -1,4 +1,5 @@
 {
+  "device": "cpu",
   "models": [
     {
       "alias": "bge-m3",

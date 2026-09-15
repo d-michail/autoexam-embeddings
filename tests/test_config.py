@@ -74,3 +74,18 @@ def test_load_config_reads_json(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"models": [model_config()]}), encoding="utf-8")
     assert load_config(path).models[0].alias == "model-one"
+
+
+def test_device_defaults_to_cpu() -> None:
+    config = ServiceConfig.model_validate({"models": [model_config()]})
+    assert config.device == "cpu"
+
+
+def test_device_accepts_cuda() -> None:
+    config = ServiceConfig.model_validate({"models": [model_config()], "device": "cuda"})
+    assert config.device == "cuda"
+
+
+def test_device_rejects_invalid_value() -> None:
+    with pytest.raises(ValidationError, match="device"):
+        ServiceConfig.model_validate({"models": [model_config()], "device": "tpu"})

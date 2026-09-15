@@ -1,0 +1,42 @@
+# CUDA runtime + Python 3.12 base for GPU inference. The base image tag and
+# the torch --index-url below must stay on the same CUDA minor version;
+# confirm both against the target cluster's NVIDIA driver/device plugin
+# before deploying (driver requirements: https://pytorch.org and the CUDA
+# toolkit release notes for the version below).
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    POETRY_VIRTUALENVS_CREATE=false \
+    HF_HOME=/var/cache/huggingface \
+    EMBEDDINGS_CONFIG_PATH=/etc/autoexam-embeddings/config.json \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.12 /usr/bin/python \
+    && pip install --no-cache-dir poetry==1.8.2 \
+    && groupadd --gid 10001 autoexam \
+    && useradd --uid 10001 --gid autoexam --no-create-home --shell /usr/sbin/nologin autoexam \
+    && mkdir -p /var/cache/huggingface /etc/autoexam-embeddings \
+    && chown -R autoexam:autoexam /var/cache/huggingface /etc/autoexam-embeddings
+
+COPY pyproject.toml poetry.lock ./
+# poetry.lock pins the CPU-only torch wheel (see pyproject.toml's pytorch-cpu
+# source); install everything else from it, then replace torch with the
+# matching CUDA build so there is no second lock file to keep in sync.
+RUN poetry install --only main --no-root --no-interaction --no-ansi \
+    && pip install --no-cache-dir --force-reinstall torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+
+COPY src ./src
+ENV PYTHONPATH=/app/src
+
+USER 10001:10001
+EXPOSE 8000
+
+STOPSIGNAL SIGTERM
+CMD ["uvicorn", "autoexam_embeddings.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

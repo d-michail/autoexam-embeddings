@@ -77,15 +77,15 @@ def log_event(event: str, *, level: int = logging.INFO, **fields: object) -> Non
     )
 
 
-def default_model_factory(config: ModelConfig) -> EmbeddingModel:
-    """Load one CPU model without executing repository-provided Python code."""
+def default_model_factory(config: ModelConfig, *, device: str) -> EmbeddingModel:
+    """Load one model without executing repository-provided Python code."""
 
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(
         config.model_id,
         revision=config.revision,
-        device="cpu",
+        device=device,
         trust_remote_code=False,
     )
     model.max_seq_length = config.max_sequence_length
@@ -108,20 +108,25 @@ class ModelRuntime:
 class ModelRegistry:
     """Ordered registry of configured model runtimes."""
 
-    def __init__(self, config: ServiceConfig, model_factory: ModelFactory = default_model_factory):
+    def __init__(self, config: ServiceConfig, model_factory: ModelFactory | None = None):
+        if config.device == "cuda" and not torch.cuda.is_available():
+            raise ModelUnavailableError(
+                "device is configured as cuda but no CUDA device is visible"
+            )
         self._runtimes = {model.alias: ModelRuntime(model) for model in config.models}
-        self._model_factory = model_factory
+        self._model_factory = model_factory or partial(default_model_factory, device=config.device)
         worker_count = sum(model.max_concurrency for model in config.models)
         self._executor = ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix="embedding-worker",
         )
-        # Concurrent inference calls share the pod's CPU budget: without this,
-        # each call's intra-op parallelism defaults to every visible core, so
-        # max_concurrency > 1 oversubscribes the CPU instead of adding real
-        # parallelism. torch.set_num_threads is process-global, so this must
-        # be sized for the worst case of all workers running at once.
-        torch.set_num_threads(max(1, config.cpu_limit // worker_count))
+        if config.device == "cpu":
+            # Concurrent inference calls share the pod's CPU budget: without this,
+            # each call's intra-op parallelism defaults to every visible core, so
+            # max_concurrency > 1 oversubscribes the CPU instead of adding real
+            # parallelism. torch.set_num_threads is process-global, so this must
+            # be sized for the worst case of all workers running at once.
+            torch.set_num_threads(max(1, config.cpu_limit // worker_count))
         self.ready = False
 
     async def start(self) -> None:

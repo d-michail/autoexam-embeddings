@@ -83,6 +83,7 @@ class ServiceConfig(BaseModel):
 
     models: list[ModelConfig] = Field(min_length=1)
     cpu_limit: PositiveInt = 1
+    device: Literal["cpu", "cuda"] = "cpu"
 
     @model_validator(mode="after")
     def validate_unique_aliases(self) -> ServiceConfig:
