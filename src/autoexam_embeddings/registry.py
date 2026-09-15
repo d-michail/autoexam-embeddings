@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Literal, Protocol, TypeVar, cast
 
+import torch
+
 from . import chunking
 from .config import ModelConfig, ServiceConfig
 from .schemas import (
@@ -114,6 +116,12 @@ class ModelRegistry:
             max_workers=worker_count,
             thread_name_prefix="embedding-worker",
         )
+        # Concurrent inference calls share the pod's CPU budget: without this,
+        # each call's intra-op parallelism defaults to every visible core, so
+        # max_concurrency > 1 oversubscribes the CPU instead of adding real
+        # parallelism. torch.set_num_threads is process-global, so this must
+        # be sized for the worst case of all workers running at once.
+        torch.set_num_threads(max(1, config.cpu_limit // worker_count))
         self.ready = False
 
     async def start(self) -> None:

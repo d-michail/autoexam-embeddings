@@ -49,6 +49,7 @@ class TokenLimits(BaseModel):
     query: int
     fingerprint: str
     batch_size: int
+    max_concurrency: int
 
 
 class ChunkRequest(BaseModel):

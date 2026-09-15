@@ -40,6 +40,7 @@ def limits(model: Any, config: ModelConfig) -> TokenLimits:
         query=config.max_sequence_length - token_count(model, "", "query"),
         fingerprint=fingerprint(config),
         batch_size=config.batch_size,
+        max_concurrency=config.max_concurrency,
     )
 
 
