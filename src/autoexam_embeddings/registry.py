@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import json
 import logging
 import math
+import queue
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -100,6 +103,8 @@ class ModelRuntime:
     dimension: int | None = None
     load_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     semaphore: asyncio.Semaphore = field(init=False)
+    # One entry per concurrency slot once loaded; see ModelRegistry._build_view.
+    views: queue.SimpleQueue[EmbeddingModel] = field(init=False, default_factory=queue.SimpleQueue)
 
     def __post_init__(self) -> None:
         self.semaphore = asyncio.Semaphore(self.config.max_concurrency)
@@ -147,6 +152,8 @@ class ModelRegistry:
             runtime.model = None
             runtime.dimension = None
             runtime.status = "unloaded"
+            while not runtime.views.empty():
+                runtime.views.get()
         self._executor.shutdown(wait=True, cancel_futures=True)
 
     def get(self, alias: str) -> ModelRuntime | None:
@@ -183,14 +190,14 @@ class ModelRegistry:
             input_type=input_type,
             input_characters=sum(len(value) for value in inputs),
         )
-        model = await self._get_or_load(runtime)
+        await self._get_or_load(runtime)
         started_at = time.perf_counter()
         wait_started_at = time.perf_counter()
         try:
             async with runtime.semaphore:
                 wait_ms = round((time.perf_counter() - wait_started_at) * 1000, 3)
-                vectors = await self._run_in_worker(
-                    partial(self._encode, runtime.config, model, inputs, input_type)
+                vectors = await self._run_with_view(
+                    runtime, lambda view: self._encode(runtime.config, view, inputs, input_type)
                 )
         except (ModelUnavailableError, RequestLimitError):
             raise
@@ -229,10 +236,12 @@ class ModelRegistry:
 
     async def token_limits(self, alias: str) -> TokenLimits:
         runtime = self._runtimes[alias]
-        model = await self._get_or_load(runtime)
+        await self._get_or_load(runtime)
         started_at = time.perf_counter()
         async with runtime.semaphore:
-            result = await self._run_in_worker(partial(chunking.limits, model, runtime.config))
+            result = await self._run_with_view(
+                runtime, lambda view: chunking.limits(view, runtime.config)
+            )
         log_event(
             "limits_resolved",
             level=logging.DEBUG,
@@ -246,12 +255,12 @@ class ModelRegistry:
 
     async def chunk(self, alias: str, payload: ChunkRequest) -> ChunkResponse:
         runtime = self._runtimes[alias]
-        model = await self._get_or_load(runtime)
+        await self._get_or_load(runtime)
         started_at = time.perf_counter()
         try:
             async with runtime.semaphore:
-                result = await self._run_in_worker(
-                    partial(chunking.chunk, model, runtime.config, payload)
+                result = await self._run_with_view(
+                    runtime, lambda view: chunking.chunk(view, runtime.config, payload)
                 )
         except Exception as error:
             log_event(
@@ -305,6 +314,12 @@ class ModelRegistry:
             runtime.model = model
             runtime.dimension = dimension
             runtime.status = "ready"
+            # One slot is the model itself; the rest are isolated views so that
+            # up to max_concurrency callers can run inference at once without
+            # sharing (and racing on) one tokenizer instance.
+            runtime.views.put(model)
+            for _ in range(runtime.config.max_concurrency - 1):
+                runtime.views.put(self._build_view(model))
             log_event(
                 "model_loaded",
                 model_alias=runtime.config.alias,
@@ -368,6 +383,55 @@ class ModelRegistry:
         except BaseException:
             future.cancel()
             raise
+
+    async def _run_with_view(
+        self, runtime: ModelRuntime, function: Callable[[EmbeddingModel], WorkerResult]
+    ) -> WorkerResult:
+        """Run blocking work on one of the runtime's exclusive model views.
+
+        Checkout/return happens inside the worker thread (not here) so it
+        never blocks the event loop; `runtime.semaphore` already bounds
+        concurrent callers to `len(runtime.views)`, so `get()` does not wait
+        in practice.
+        """
+
+        def task() -> WorkerResult:
+            view = runtime.views.get()
+            try:
+                return function(view)
+            finally:
+                runtime.views.put(view)
+
+        return await self._run_in_worker(task)
+
+    @staticmethod
+    def _build_view(model: EmbeddingModel) -> EmbeddingModel:
+        """An isolated view of `model` for one concurrency slot.
+
+        HuggingFace's fast tokenizer mutates shared Rust-side state on every
+        call (`enable_truncation`/`enable_padding`, via
+        PreTrainedTokenizerFast.set_truncation_and_padding), which is not
+        thread-safe: two views executing concurrently on the same tokenizer
+        instance intermittently fail with "RuntimeError: Already borrowed"
+        (confirmed empirically -- a batch racing a differently-shaped
+        concurrent batch on bge-m3 reproduces it reliably). Cloning only the
+        tokenizer (CPU-only, cheap) per slot -- while sharing the
+        GPU-resident transformer weights and the stateless pooling/normalize
+        modules by reference -- isolates the racy state without duplicating
+        the model's weights.
+
+        This reaches past the `EmbeddingModel` protocol into
+        `SentenceTransformer`'s internal `nn.Sequential` structure, which
+        only `default_model_factory` is expected to construct.
+        """
+        sentence_transformer = cast(Any, model)
+        first = sentence_transformer._first_module()
+        first_view = copy.copy(first)
+        first_view.tokenizer = copy.deepcopy(first.tokenizer)
+        view = copy.copy(sentence_transformer)
+        view._modules = OrderedDict(sentence_transformer._modules)
+        view._modules[next(iter(view._modules))] = first_view
+        return cast(EmbeddingModel, view)
 
     @staticmethod
     def _language_match(
